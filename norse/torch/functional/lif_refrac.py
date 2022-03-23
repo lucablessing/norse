@@ -10,7 +10,7 @@ from norse.torch.functional.lif import (
     lif_step_sparse,
     lif_feed_forward_step,
 )
-from norse.torch.functional.threshold import threshold
+from norse.torch.functional.threshold import threshold, SurrogateMethod
 
 
 class LIFRefracState(NamedTuple):

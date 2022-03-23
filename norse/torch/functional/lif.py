@@ -27,16 +27,18 @@ gradient approach that uses the :mod:`.heaviside` step function:
     H[n]=\begin{cases} 0, & n <= 0 \\ 1, & n \gt 0 \end{cases}
 
 """
+from tkinter import S
 from typing import NamedTuple, Optional, Tuple
 import torch
 import torch.jit
 
 try:
     import norse_op
-except ModuleNotFoundError:  # pragma: no cover
+except (ModuleNotFoundError, ImportError):  # pragma: no cover
     pass
 
-from norse.torch.functional.threshold import threshold
+
+from norse.torch.functional.threshold import threshold, SurrogateMethod
 
 
 class LIFParameters(NamedTuple):
@@ -50,7 +52,7 @@ class LIFParameters(NamedTuple):
         v_leak (torch.Tensor): leak potential in mV
         v_th (torch.Tensor): threshold potential in mV
         v_reset (torch.Tensor): reset potential in mV
-        method (str): method to determine the spike threshold
+        method (SurrogateMethod): method to determine the spike threshold
                       (relevant for surrogate gradients)
         alpha (float): hyper parameter to use in surrogate gradient computation
     """
@@ -60,7 +62,7 @@ class LIFParameters(NamedTuple):
     v_leak: torch.Tensor = torch.as_tensor(0.0)
     v_th: torch.Tensor = torch.as_tensor(1.0)
     v_reset: torch.Tensor = torch.as_tensor(0.0)
-    method: str = "super"
+    method: SurrogateMethod = SurrogateMethod.Super
     alpha: float = torch.as_tensor(100.0)
 
 
@@ -115,17 +117,17 @@ class LIFParametersJIT(NamedTuple):
         v_leak (torch.Tensor): leak potential in mV
         v_th (torch.Tensor): threshold potential in mV
         v_reset (torch.Tensor): reset potential in mV
-        method (str): method to determine the spike threshold
+        method (SurrogateMethod): method to determine the spike threshold
                       (relevant for surrogate gradients)
         alpha (torch.Tensor): hyper parameter to use in surrogate gradient computation
     """
 
-    tau_syn_inv: float =  1.0/5e-3
-    tau_mem_inv: float = 1.0/1e-2
+    tau_syn_inv: float = 1.0 / 5e-3
+    tau_mem_inv: float = 1.0 / 1e-2
     v_leak: float = 0.0
     v_th: float = 1.0
     v_reset: float = 0.0
-    method: str = "super"
+    method: SurrogateMethod = SurrogateMethod.Super
     alpha: float = 100.0
 
 
@@ -233,10 +235,10 @@ def lif_step(
         p (LIFParameters): parameters of a leaky integrate and fire neuron
         dt (float): Integration timestep to use
     """
-    z, v, i = norse_op.lif_super_step(
-        input_tensor, state, input_weights, recurrent_weights, p, dt
+    z, s = _lif_step_jit(
+        input_tensor, state, input_weights, recurrent_weights, LIFParametersJIT(*p), dt
     )
-    return z, LIFState(z=z, v=v, i=i)
+    return z, s
 
 
 def lif_step_integral(
@@ -317,7 +319,7 @@ def _lif_feed_forward_step_jit(
 
 def lif_feed_forward_step(
     input_tensor: torch.Tensor,
-    state: Optional[LIFFeedForwardState],
+    state: LIFFeedForwardState,
     p: LIFParameters = LIFParameters(),
     dt: float = 0.001,
 ) -> Tuple[torch.Tensor, LIFFeedForwardState]:
@@ -354,46 +356,8 @@ def lif_feed_forward_step(
         p (LIFParameters): parameters of a leaky integrate and fire neuron
         dt (float): Integration timestep to use
     """
-    z, v, i = norse_op.lif_super_feed_forward_step(input_tensor, state, p, dt)
-    return z, LIFFeedForwardState(v=v, i=i)
-
-
-def lif_feed_forward_integral(
-    input_tensor: torch.Tensor,
-    state: LIFFeedForwardState,
-    p: LIFParameters = LIFParameters(),
-    dt: float = 0.001,
-) -> Tuple[torch.Tensor, LIFState]:
-    r"""Computes multiple euler-integration steps of a LIF neuron-model. More
-    specifically it integrates the following ODE
-
-    .. math::
-        \begin{align*}
-            \dot{v} &= 1/\tau_{\text{mem}} (v_{\text{leak}} - v + i) \\
-            \dot{i} &= -1/\tau_{\text{syn}} i
-        \end{align*}
-
-    together with the jump condition
-
-    .. math::
-        z = \Theta(v - v_{\text{th}})
-
-    and transition equations
-
-    .. math::
-        \begin{align*}
-            v &= (1-z) v + z v_{\text{reset}} \\
-            i &= i + i_{\text{in}}
-        \end{align*}
-
-    Parameters:
-        input_tensor (torch.Tensor): the input spikes with the outer dimension assumed to be timesteps
-        s (LIFState): current state of the LIF neuron
-        p (LIFParameters): parameters of a leaky integrate and fire neuron
-        dt (float): Integration timestep to use
-    """
-    z, v, i = norse_op.lif_super_feed_forward_integral(input_tensor, state, p, dt)
-    return z, LIFState(z=z, v=v, i=i)
+    z, s = _lif_feed_forward_step_jit(input_tensor, state, LIFParametersJIT(*p), dt)
+    return z, s
 
 
 @torch.jit.script
@@ -452,6 +416,46 @@ def _lif_feed_forward_integral_jit(
         outputs.append(z_new)
         state = LIFFeedForwardState(v=v_new, i=i_new)
     return torch.stack(outputs), state
+
+
+def lif_feed_forward_integral(
+    input_tensor: torch.Tensor,
+    state: LIFFeedForwardState,
+    p: LIFParameters = LIFParameters(),
+    dt: float = 0.001,
+) -> Tuple[torch.Tensor, LIFState]:
+    r"""Computes multiple euler-integration steps of a LIF neuron-model. More
+    specifically it integrates the following ODE
+
+    .. math::
+        \begin{align*}
+            \dot{v} &= 1/\tau_{\text{mem}} (v_{\text{leak}} - v + i) \\
+            \dot{i} &= -1/\tau_{\text{syn}} i
+        \end{align*}
+
+    together with the jump condition
+
+    .. math::
+        z = \Theta(v - v_{\text{th}})
+
+    and transition equations
+
+    .. math::
+        \begin{align*}
+            v &= (1-z) v + z v_{\text{reset}} \\
+            i &= i + i_{\text{in}}
+        \end{align*}
+
+    Parameters:
+        input_tensor (torch.Tensor): the input spikes with the outer dimension assumed to be timesteps
+        s (LIFState): current state of the LIF neuron
+        p (LIFParameters): parameters of a leaky integrate and fire neuron
+        dt (float): Integration timestep to use
+    """
+    z, v, i = _lif_feed_forward_integral_jit(
+        input_tensor, state, LIFParametersJIT(*p), dt
+    )
+    return z, LIFState(z=z, v=v, i=i)
 
 
 def lif_feed_forward_step_sparse(
